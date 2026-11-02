@@ -6,11 +6,21 @@
  *
  * Every handler takes a Web Request and returns a Response, so tests drive them directly.
  */
-import { createChallenge, verifySignIn, type NonceStore } from '@bwalletx/connect/server';
-import { isPkceChallenge, isPkceVerifier, pkceChallenge } from '@bwalletx/connect/sso';
-import { CODE_TTL_MS, HUB_SESSION_MS, ID_TOKEN_SECONDS, ROTATE_AFTER_MS } from './config';
+import { ProtoWallet } from '@bsv/sdk';
+import { isIdentityKey } from '@bwalletx/connect/server';
+import {
+  HUB_SIGNIN_PROTOCOL,
+  checkLogoutHint,
+  hubSignInMessage,
+  isPkceChallenge,
+  isPkceVerifier,
+  parseHubSignInMessage,
+  pkceChallenge,
+  safeReturnTo,
+} from '@bwalletx/connect/sso';
+import { CHALLENGE_TTL_MS, CODE_TTL_MS, DEFAULT_RATE_LIMITS, HUB_SESSION_MS, ID_TOKEN_SECONDS, MAX_SESSIONS_PER_IDENTITY, RATE_WINDOW_MS, ROTATE_AFTER_MS, type RateLimits } from './config';
 import { randomToken, readCookie, sha256 } from './crypto';
-import { errorPage, page } from './html';
+import { confirmLogoutPage, errorPage, page } from './html';
 import type { Names } from './paymail';
 import type { Client, Registry } from './registry';
 import type { Signer } from './keys';
@@ -23,6 +33,8 @@ export interface HubDeps {
   signer: Signer;
   /** paymail + $handle for a key (best effort). */
   lookup?: (identityKey: string) => Promise<Names>;
+  /** Requests per minute per IP and per identity key. Defaults: DEFAULT_RATE_LIMITS. */
+  limits?: Partial<RateLimits>;
   now?: () => number;
 }
 
@@ -60,16 +72,47 @@ export class Hub {
   private cookie(token: string, maxAgeS: number): string {
     return [`${this.cookieName}=${token}`, 'Path=/', `Max-Age=${maxAgeS}`, 'HttpOnly', 'SameSite=Lax', ...(this.secure ? ['Secure'] : [])].join('; ');
   }
-  private nonceStore(): NonceStore {
-    return { put: (n, c) => this.d.store.putChallenge(n, c), take: (n) => this.d.store.takeChallenge(n) };
+  /** The session the hub cookie points at (live or not). */
+  private async cookieSession(req: Request): Promise<HubSession | null> {
+    const tok = readCookie(req.headers.get('cookie'), this.cookieName);
+    if (!tok || tok.length > 128) return null;
+    return this.d.store.getSessionByToken(await sha256(tok));
   }
 
   /** The hub session for this request, if it exists, is unexpired and was not signed out everywhere. */
   async currentSession(req: Request): Promise<HubSession | null> {
-    const tok = readCookie(req.headers.get('cookie'), this.cookieName);
-    if (!tok || tok.length > 128) return null;
-    const s = await this.d.store.getSessionByToken(await sha256(tok));
+    const s = await this.cookieSession(req);
     return s && (await this.live(s)) ? s : null;
+  }
+
+  /**
+   * The client's IP. On Vercel, x-vercel-forwarded-for / x-real-ip are set by the platform (a client can't forge
+   * them); x-forwarded-for is the fallback for other hosts behind a proxy that overwrites it.
+   */
+  private clientIp(req: Request): string {
+    const h = req.headers;
+    const v = h.get('x-vercel-forwarded-for') ?? h.get('x-real-ip') ?? h.get('x-forwarded-for')?.split(',')[0];
+    return (v ?? '').trim().slice(0, 64) || 'unknown';
+  }
+
+  /**
+   * Fixed-window limits (1 minute) in the store, so they hold across instances. One bucket per IP (hashed: no raw IPs
+   * stored) and, where the request names one, per identity key. 429 + Retry-After when a bucket is over.
+   */
+  private async limited(route: keyof RateLimits, who: { req?: Request; identityKey?: string }): Promise<Response | null> {
+    const max = this.d.limits?.[route] ?? DEFAULT_RATE_LIMITS[route];
+    const now = this.now();
+    const buckets: string[] = [];
+    if (who.req) buckets.push(`${route}:ip:${(await sha256(this.clientIp(who.req))).slice(0, 22)}`);
+    if (who.identityKey) buckets.push(`${route}:key:${who.identityKey}`);
+    for (const b of buckets) {
+      const { hits, resetAt } = await this.d.store.hit(b, RATE_WINDOW_MS, now);
+      if (hits > max) {
+        const retry = String(Math.max(1, Math.ceil((resetAt - now) / 1000)));
+        return json({ error: 'rate_limited', error_description: 'Too many requests. Try again in a minute.' }, 429, { 'retry-after': retry });
+      }
+    }
+    return null;
   }
 
   private async live(s: HubSession): Promise<boolean> {
@@ -153,6 +196,8 @@ export class Hub {
   /** POST /token (site server → hub): code + code_verifier + client_id + redirect_uri → signed ID token. */
   async token(req: Request): Promise<Response> {
     if (req.method !== 'POST') return oauthError('invalid_request', 'POST only', 405);
+    const slow = await this.limited('token', { req });
+    if (slow) return slow;
     let b: Record<string, string> = {};
     try {
       const ct = req.headers.get('content-type') ?? '';
@@ -174,6 +219,8 @@ export class Hub {
     if (!isPkceVerifier(b.code_verifier) || (await pkceChallenge(b.code_verifier)) !== rec.codeChallenge) {
       return oauthError('invalid_grant', 'PKCE verification failed');
     }
+    const perKey = await this.limited('token', { identityKey: rec.identityKey });
+    if (perKey) return perKey;
     const s = await this.d.store.getSession(rec.sid);
     if (!s || !(await this.live(s))) return oauthError('invalid_grant', 'The hub session has ended');
     const iat = Math.floor(this.now() / 1000);
@@ -198,26 +245,62 @@ export class Hub {
 
   /** GET /session/epoch?sid= → { sid, active, epoch }. Sites cache it for at most 5 minutes. */
   async epoch(req: Request): Promise<Response> {
+    const slow = await this.limited('epoch', { req });
+    if (slow) return slow;
     const sid = new URL(req.url).searchParams.get('sid') ?? '';
     if (!/^[A-Za-z0-9_-]{8,64}$/.test(sid)) return json({ error: 'bad sid' }, 400);
     const s = await this.d.store.getSession(sid);
     if (!s) return json({ sid, active: false, epoch: null });
+    const perKey = await this.limited('epoch', { identityKey: s.identityKey });
+    if (perKey) return perKey;
     const current = await this.d.store.getEpoch(s.identityKey);
     return json({ sid, active: s.expiresAt > this.now() && s.epoch === current, epoch: current });
   }
 
-  /** GET /logout?client_id=&redirect_uri= : end the hub session and bump the epoch, signing out every b*X site. */
+  /**
+   * /logout?client_id=&redirect_uri=[&logout_hint=] : "Sign out of all b*X sites". Ends the hub session and bumps the
+   * identity's epoch, so every site's session ends within 5 minutes.
+   *
+   * A foreign page must not be able to sign people out of everything with a link or an auto-submitting form, so:
+   *   GET  with a logout_hint from a b*X site's server (logoutHint(sid): only the hub and that site know the sid)
+   *        signs out at once; any other GET shows a confirm page with a POST button.
+   *   POST (the confirm button) needs Origin: <the hub>. Cross-site POSTs are refused.
+   */
   async logout(req: Request): Promise<Response> {
+    if (req.method === 'POST') {
+      if (!this.originOk(req)) return page({ title: 'Not signed out', body: 'That sign-out request did not come from bWalletX. Nothing was changed.', status: 403 });
+      let f: URLSearchParams;
+      try {
+        f = new URLSearchParams(await req.text());
+      } catch {
+        f = new URLSearchParams();
+      }
+      return this.signOutEverywhere(req, f.get('client_id'), f.get('redirect_uri'));
+    }
+    if (req.method !== 'GET' && req.method !== 'HEAD') return json({ error: 'GET or POST only' }, 405);
     const q = new URL(req.url).searchParams;
-    const tok = readCookie(req.headers.get('cookie'), this.cookieName);
-    const s = tok && tok.length <= 128 ? await this.d.store.getSessionByToken(await sha256(tok)) : null;
+    const s = await this.cookieSession(req);
+    if (!s) return this.signOutEverywhere(req, q.get('client_id'), q.get('redirect_uri')); // nothing to end here
+    if (await checkLogoutHint(q.get('logout_hint'), s.sid, Math.floor(this.now() / 1000))) {
+      return this.signOutEverywhere(req, q.get('client_id'), q.get('redirect_uri'));
+    }
+    const client = this.d.registry.get(q.get('client_id'));
+    const to = q.get('redirect_uri');
+    return confirmLogoutPage({
+      who: s.paymail ?? s.handle ?? `${s.identityKey.slice(0, 8)}…`,
+      clientId: client && this.d.registry.postLogoutAllowed(client, to) ? client.client_id : null,
+      redirectUri: client && this.d.registry.postLogoutAllowed(client, to) ? to : null,
+    });
+  }
+
+  private async signOutEverywhere(req: Request, clientId: string | null, to: string | null): Promise<Response> {
+    const s = await this.cookieSession(req);
     if (s) {
       await this.d.store.deleteSession(s.sid);
       await this.d.store.bumpEpoch(s.identityKey);
     }
     const clear = this.cookie('', 0);
-    const client = this.d.registry.get(q.get('client_id'));
-    const to = q.get('redirect_uri');
+    const client = this.d.registry.get(clientId);
     if (client && this.d.registry.postLogoutAllowed(client, to)) {
       return new Response(null, { status: 303, headers: { location: to!, 'set-cookie': clear, 'cache-control': 'no-store' } });
     }
@@ -236,57 +319,109 @@ export class Hub {
     return req.headers.get('origin') === this.d.issuer;
   }
 
-  /** POST /api/challenge (the hub's own sign-in page only). No identity key needed: one wallet sheet. */
+  /**
+   * POST /api/challenge (the hub's own sign-in page only). No identity key needed: one wallet sheet.
+   * The wallet signs under the hub's own protocol, HUB_SIGNIN_PROTOCOL [2, 'bwalletx id sign in'], which bWalletX only
+   * accepts from id.bwalletx.com, and the message names the hub and the challenge.
+   */
   async challenge(req: Request): Promise<Response> {
     if (req.method !== 'POST') return json({ error: 'POST only' }, 405);
     if (!this.originOk(req)) return json({ error: 'Wrong origin' }, 403);
-    let b: { identityKey?: unknown } = {};
+    const slow = await this.limited('challenge', { req });
+    if (slow) return slow;
+    const nonce = randomToken(16);
+    const now = this.now();
+    const expiresAt = now + CHALLENGE_TTL_MS;
+    const message = hubSignInMessage(this.d.issuer, nonce, now);
+    await this.d.store.putChallenge(nonce, { identityKey: '', origin: this.d.issuer, message, expiresAt });
+    return json({ nonce, message, protocolID: HUB_SIGNIN_PROTOCOL, keyID: nonce, expiresAt });
+  }
+
+  /**
+   * The proven identity key, or null. The challenge is taken (deleted) first, so it works once. It must be this hub's,
+   * unexpired, its message exactly "Sign in to <hub host> · challenge <nonce> · <time>", and the signature must verify
+   * under HUB_SIGNIN_PROTOCOL with keyID = nonce for the claimed key.
+   */
+  private async checkSignIn(b: { identityKey?: unknown; nonce?: unknown; signature?: unknown }): Promise<string | null> {
+    if (typeof b.nonce !== 'string' || !/^[A-Za-z0-9_-]{16,64}$/.test(b.nonce)) return null;
+    const nonce = b.nonce;
+    const c = await this.d.store.takeChallenge(nonce);
+    if (!c || this.now() > c.expiresAt || c.origin !== this.d.issuer) return null;
+    const m = parseHubSignInMessage(c.message);
+    if (!m || m.host !== new URL(this.d.issuer).host || m.nonce !== nonce || c.message !== hubSignInMessage(this.d.issuer, nonce, m.issuedAt)) return null;
+    if (!isIdentityKey(b.identityKey)) return null;
+    const identityKey = b.identityKey.toLowerCase();
+    if (c.identityKey && c.identityKey !== identityKey) return null;
+    const sig = b.signature;
+    if (!Array.isArray(sig) || sig.length < 8 || sig.length > 80 || !sig.every((x) => Number.isInteger(x) && x >= 0 && x <= 255)) return null;
     try {
-      b = ((await req.json()) ?? {}) as { identityKey?: unknown };
+      const { valid } = await new ProtoWallet('anyone').verifySignature({
+        protocolID: HUB_SIGNIN_PROTOCOL,
+        keyID: nonce,
+        counterparty: identityKey,
+        data: Array.from(new TextEncoder().encode(c.message)),
+        signature: sig as number[],
+      });
+      return valid ? identityKey : null;
     } catch {
-      /* empty body is fine */
-    }
-    try {
-      return json(await createChallenge({ origin: this.d.issuer, identityKey: b.identityKey, store: this.nonceStore() }));
-    } catch {
-      return json({ error: 'Bad identity key' }, 400);
+      return null; // @bsv/sdk throws on a bad signature instead of returning valid: false
     }
   }
 
   /**
    * POST /api/verify { identityKey, nonce, signature, authorize? } → hub session cookie + { next }.
-   * The signature must be for a fresh challenge (single use, 2 minutes) made for this hub's origin, by the claimed key.
+   * A fresh wallet sign-in in a browser that already has a session for the same identity keeps that session (and its
+   * sid, so the other b*X sites stay signed in) and refreshes auth_time. Only "Sign out of all" ends sessions.
    */
   async verify(req: Request): Promise<Response> {
     if (req.method !== 'POST') return json({ error: 'POST only' }, 405);
     if (!this.originOk(req)) return json({ error: 'Wrong origin' }, 403);
+    const slow = await this.limited('verify', { req });
+    if (slow) return slow;
     let b: { identityKey?: unknown; nonce?: unknown; signature?: unknown; authorize?: unknown };
     try {
       b = (await req.json()) as typeof b;
     } catch {
       return json({ error: 'Unreadable body' }, 400);
     }
-    const identityKey = await verifySignIn({ origin: this.d.issuer, identityKey: b.identityKey, nonce: b.nonce, signature: b.signature, store: this.nonceStore() });
+    const identityKey = await this.checkSignIn(b ?? {});
     if (!identityKey) return json({ error: 'That signature was not accepted. Start again.' }, 401);
+    // Counted per key only once the signature is good, so nobody can lock a stranger out by naming their key.
+    const perKey = await this.limited('verify', { identityKey });
+    if (perKey) return perKey;
 
-    const old = await this.currentSession(req);
-    if (old) await this.d.store.deleteSession(old.sid);
     const names = (await this.d.lookup?.(identityKey)) ?? { paymail: null, handle: null };
     const now = this.now();
     const token = randomToken(32);
-    const s: HubSession = {
-      sid: randomToken(18),
-      tokenHash: await sha256(token),
-      identityKey,
-      paymail: names.paymail,
-      handle: names.handle,
-      epoch: await this.d.store.getEpoch(identityKey),
-      authTime: now,
-      createdAt: now,
-      rotatedAt: now,
-      expiresAt: now + HUB_SESSION_MS,
-    };
-    await this.d.store.createSession(s);
+    const old = await this.currentSession(req);
+    if (old && old.identityKey === identityKey) {
+      // Same wallet, same browser: keep the sid, new cookie token, fresh auth_time.
+      await this.d.store.updateSession(old.sid, {
+        tokenHash: await sha256(token),
+        rotatedAt: now,
+        expiresAt: now + HUB_SESSION_MS,
+        authTime: now,
+        paymail: names.paymail,
+        handle: names.handle,
+      });
+    } else {
+      // A different wallet in this browser: the previous one is signed out of the hub here (its own sites follow).
+      if (old) await this.d.store.deleteSession(old.sid);
+      await this.d.store.createSession({
+        sid: randomToken(18),
+        tokenHash: await sha256(token),
+        identityKey,
+        paymail: names.paymail,
+        handle: names.handle,
+        epoch: await this.d.store.getEpoch(identityKey),
+        authTime: now,
+        createdAt: now,
+        rotatedAt: now,
+        expiresAt: now + HUB_SESSION_MS,
+      });
+      // At most MAX_SESSIONS_PER_IDENTITY hub sessions per identity; the oldest go first.
+      await this.d.store.evictSessions(identityKey, MAX_SESSIONS_PER_IDENTITY);
+    }
 
     // Continue the sign-in the site started. prompt is dropped: the wallet sign-in just happened.
     let next = '/';
@@ -296,7 +431,7 @@ export class Hub {
         const v = (b.authorize as Record<string, unknown>)[k];
         if (typeof v === 'string' && k !== 'prompt') q.set(k, v);
       }
-      if (this.checkAuthorize(q).ok) next = `/authorize?${q}`;
+      if (this.checkAuthorize(q).ok) next = safeReturnTo(`/authorize?${q}`, '/');
     }
     return json({ ok: true, identityKey, paymail: names.paymail, handle: names.handle, next }, 200, { 'set-cookie': this.cookie(token, HUB_SESSION_MS / 1000) });
   }

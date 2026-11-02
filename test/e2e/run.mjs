@@ -42,7 +42,7 @@ page.on('pageerror', (e) => console.log('  [pageerror]', e.message));
 // The test wallet, answering BRC-100 calls from the hub page.
 await page.exposeFunction('__bwxTestWallet', async (method, args) => {
   const t0 = Date.now();
-  const rec = { method, t0, t1: 0 };
+  const rec = { method, t0, t1: 0, args };
   calls.push(rec);
   await new Promise((r) => setTimeout(r, 25)); // a wallet takes a moment; lets us see the calls overlap
   let out;
@@ -103,6 +103,14 @@ try {
   const key = calls.find((c) => c.method === 'getPublicKey');
   const sig = calls.find((c) => c.method === 'createSignature');
   check(!!key && !!sig && key.t0 < sig.t1 && sig.t0 < key.t1, 'one sheet: getPublicKey and createSignature were in flight together');
+  check(
+    JSON.stringify(sig?.args?.protocolID) === JSON.stringify([2, 'bwalletx id sign in']),
+    `wallet asked to sign under the hub's own protocol ${JSON.stringify(sig?.args?.protocolID)} (not [2,"bwallet sign in"])`,
+  );
+  const signedText = new TextDecoder().decode(new Uint8Array(sig?.args?.data ?? []));
+  const host = new URL(HUB).host;
+  const m = new RegExp(`^Sign in to ${host.replace(/[.]/g, '\\.')} · challenge ([A-Za-z0-9_-]+) · \\d{4}-\\d{2}-\\d{2}T[0-9:.]+Z$`).exec(signedText);
+  check(!!m && sig.args.keyID === m[1], `signed message names the hub and the challenge (keyID = nonce): "${signedText}"`);
   check(nav.some((u) => u.startsWith(SITE + '/sso/callback?code=')), 'hub redirected to BSVAPI /sso/callback with a code');
   check(nav.some((u) => u.startsWith(HUB + '/authorize?')), 'went through hub /authorize after the wallet sign-in');
   const cookies = await siteCookies();
@@ -143,6 +151,7 @@ try {
   await page.waitForSelector('[data-bwx-sso-signin]', { timeout: 120000 });
   check(page.url() === SITE + '/', `hub sent the visitor back to the registered home page (${page.url()})`);
   check(nav.some((u) => u.startsWith(HUB + '/logout?')), 'went through hub /logout');
+  check(nav.some((u) => u.startsWith(HUB + '/logout?') && new URL(u).searchParams.get('logout_hint')), "the site's link carried a logout_hint (one click, no confirm page)");
   check((await siteCookies()).length === 0, 'BSVAPI session cookie cleared');
   check(!(await page.cookies(HUB)).some((c) => c.name === 'bwx_hub' && c.value), 'hub cookie cleared');
   const after = await sessionJson();
@@ -155,7 +164,44 @@ try {
   check(nav.some((u) => u.includes('error=login_required')), 'after logout a quiet check returns login_required');
   await page.screenshot({ path: path.join(SHOTS, 'e2e-5-signed-out.png') });
 
-  // 6. Open redirect attempt at the hub: unregistered redirect_uri → error page, no redirect.
+  // 6. /logout can't be triggered by a foreign page. Sign in again first.
+  await page.evaluate(() => sessionStorage.clear());
+  await page.goto(SITE + '/', { waitUntil: 'networkidle0', timeout: 120000 });
+  await page.waitForSelector('[data-bwx-sso-signin]', { timeout: 120000 });
+  await Promise.all([page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 120000 }), page.click('[data-bwx-sso-signin]')]);
+  await page.waitForSelector('[data-signin-button]', { timeout: 120000 });
+  await page.click('[data-signin-button]');
+  await page.waitForFunction((site) => location.origin === site, { timeout: 120000 }, SITE);
+  await page.waitForSelector('[data-bwx-sso-chip]', { timeout: 120000 });
+  const hubLive = async () => (await page.cookies(HUB)).some((c) => c.name === 'bwx_hub' && c.value);
+  check(await hubLive(), 'signed in again (hub cookie set)');
+  //   a. a plain link to the hub's /logout (no hint): a confirm page, nobody signed out
+  let resp = await page.goto(`${HUB}/logout?client_id=bsvapi&redirect_uri=${encodeURIComponent(SITE + '/')}`, { waitUntil: 'networkidle0' });
+  const confirmTitle = await page.$eval('h1', (e) => e.textContent);
+  check(resp.status() === 200 && confirmTitle === 'Sign out of all b*X sites?' && !!(await page.$('form[method="post"] [data-confirm]')), `GET /logout without a hint → confirm page ("${confirmTitle}")`);
+  check(await hubLive(), 'the link alone signed nobody out');
+  await page.screenshot({ path: path.join(SHOTS, 'e2e-6-logout-confirm.png') });
+  //   b. a cross-site auto-submitting form from another origin (the site stands in for "evil"): refused
+  await page.goto(SITE + '/', { waitUntil: 'networkidle0' });
+  const [xs] = await Promise.all([
+    page.waitForNavigation({ waitUntil: 'networkidle0' }),
+    page.evaluate((hub) => {
+      const f = document.createElement('form');
+      f.method = 'POST';
+      f.action = hub + '/logout';
+      document.body.appendChild(f);
+      f.submit();
+    }, HUB),
+  ]);
+  check(xs.status() === 403, `cross-site POST /logout refused (${xs.status()})`);
+  check(await hubLive(), 'still signed in after the cross-site POST');
+  //   c. the confirm button (same-origin POST, Origin = hub) does sign out
+  await page.goto(`${HUB}/logout?client_id=bsvapi&redirect_uri=${encodeURIComponent(SITE + '/')}`, { waitUntil: 'networkidle0' });
+  const [done] = await Promise.all([page.waitForNavigation({ waitUntil: 'networkidle0' }), page.click('[data-confirm]')]);
+  await page.waitForFunction((site) => location.origin === site, { timeout: 120000 }, SITE).catch(() => {});
+  check(!(await hubLive()) && page.url() === SITE + '/', `confirm button signed out and returned to the site (${page.url()}, ${done?.status()})`);
+
+  // 7. Open redirect attempt at the hub: unregistered redirect_uri → error page, no redirect.
   const r = await page.goto(`${HUB}/authorize?client_id=bsvapi&redirect_uri=${encodeURIComponent('https://evil.example/cb')}&state=${'s'.repeat(20)}&code_challenge=${'c'.repeat(43)}&code_challenge_method=S256`);
   check(r.status() === 400 && new URL(page.url()).origin === HUB, `unregistered redirect_uri → hub error page (${r.status()}), no redirect`);
 } catch (e) {

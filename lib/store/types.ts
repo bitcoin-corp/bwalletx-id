@@ -44,10 +44,21 @@ export interface HubStore {
   createSession(s: HubSession): Promise<void>;
   getSession(sid: string): Promise<HubSession | null>;
   getSessionByToken(tokenHash: string): Promise<HubSession | null>;
-  updateSession(sid: string, patch: Partial<Pick<HubSession, 'tokenHash' | 'rotatedAt' | 'expiresAt'>>): Promise<void>;
+  updateSession(sid: string, patch: SessionPatch): Promise<void>;
   deleteSession(sid: string): Promise<void>;
+  /** Keep this identity's `keep` newest hub sessions (by createdAt) and delete the rest. Returns how many were deleted. */
+  evictSessions(identityKey: string, keep: number): Promise<number>;
   /** 0 for an identity that was never signed out everywhere. */
   getEpoch(identityKey: string): Promise<number>;
   /** Sign this identity out everywhere: returns the new epoch. */
   bumpEpoch(identityKey: string): Promise<number>;
+  /**
+   * Fixed-window rate limit: count one hit on `bucket` in the window containing `now` (windows are `windowMs` long,
+   * aligned to the epoch). Returns the hits so far in this window, including this one, and when the window ends.
+   */
+  hit(bucket: string, windowMs: number, now: number): Promise<{ hits: number; resetAt: number }>;
+  /** Delete expired challenges, codes, sessions (a day after expiry) and rate-limit windows. */
+  cleanup(): Promise<void>;
 }
+
+export type SessionPatch = Partial<Pick<HubSession, 'tokenHash' | 'rotatedAt' | 'expiresAt' | 'authTime' | 'paymail' | 'handle'>>;

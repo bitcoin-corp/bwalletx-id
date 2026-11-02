@@ -1,6 +1,7 @@
 'use client';
 
 import { bindPrewarm, pairingModal, signInWithBwalletX, type SignInStatus } from '@bwalletx/connect';
+import { HUB_SIGNIN_PROTOCOL, safeReturnTo } from '@bwalletx/connect/sso';
 import { useEffect, useRef, useState } from 'react';
 
 const LABEL: Record<SignInStatus, string> = {
@@ -41,7 +42,8 @@ export default function SignIn({ site, authorize }: { site: string | null; autho
     try {
       // ONE sheet: the challenge first (no key needed), then the identity key and the signature together.
       const r = await signInWithBwalletX({
-        challenge: () => post('/api/challenge', {}),
+        // Always the hub's own protocol (bWalletX only accepts it from id.bwalletx.com), whatever the server says.
+        challenge: async () => ({ ...(await post<{ nonce: string; message: string; keyID: string }>('/api/challenge', {})), protocolID: HUB_SIGNIN_PROTOCOL }),
         pairing: pairingModal({ title: 'Sign in with bWalletX' }),
         onStatus: (s) => setLabel(LABEL[s]),
       });
@@ -54,7 +56,7 @@ export default function SignIn({ site, authorize }: { site: string | null; autho
       });
       setLabel(`Signed in as ${v.paymail ?? `${r.identityKey.slice(0, 8)}…`}`);
       // Same-origin path from the hub (validated there); the hub then redirects to the registered site address.
-      window.location.assign(v.next.startsWith('/') && !v.next.startsWith('//') ? v.next : '/');
+      window.location.assign(safeReturnTo(v.next, '/'));
     } catch (e) {
       setLabel(null);
       setError(plain(e));
