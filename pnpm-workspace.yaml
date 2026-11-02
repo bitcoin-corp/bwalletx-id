@@ -1,0 +1,7 @@
+# pnpm 11+ settings. esbuild (vitest) and sharp (next) need their install scripts for native binaries.
+allowBuilds:
+  esbuild: true
+  sharp: true
+onlyBuiltDependencies:
+  - esbuild
+  - sharp

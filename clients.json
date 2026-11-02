@@ -1,0 +1,19 @@
+{
+  "$comment": "b*X single sign-on client registry. Exact https redirect URIs only, no wildcards. dev_redirect_uris are honoured only when NODE_ENV !== 'production'. Register live sites only (see https://b0-x.com/api/sites stage), plus sites built with SSO from day one.",
+  "clients": [
+    {
+      "client_id": "b0-x",
+      "name": "b0-x.com",
+      "tier": "standard",
+      "redirect_uris": ["https://b0-x.com/sso/callback"],
+      "dev_redirect_uris": ["http://localhost:3402/sso/callback"]
+    },
+    {
+      "client_id": "bsvapi",
+      "name": "BSVAPI",
+      "tier": "standard",
+      "redirect_uris": ["https://www.bsvapi.com/sso/callback", "https://bsvapi.com/sso/callback"],
+      "dev_redirect_uris": ["http://localhost:3401/sso/callback"]
+    }
+  ]
+}
