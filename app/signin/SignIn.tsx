@@ -1,33 +1,9 @@
 'use client';
 
-import { bindPrewarm, pairingModal, signInWithBwalletX, type SignInStatus } from '@bwalletx/connect';
-import { HUB_SIGNIN_PROTOCOL, safeReturnTo } from '@bwalletx/connect/sso';
+import { bindPrewarm, pairingModal, signInWithBwalletX } from '@bwalletx/connect';
+import { safeReturnTo } from '@bwalletx/connect/sso';
 import { useEffect, useRef, useState } from 'react';
-
-const LABEL: Record<SignInStatus, string> = {
-  finding: 'Opening your wallet…',
-  opening: 'Approve in bWalletX…',
-  signing: 'Approve in bWalletX…',
-  pairing: 'Scan the QR with bWalletX…',
-};
-
-async function post<T>(url: string, body: unknown): Promise<T> {
-  const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), credentials: 'same-origin' });
-  const j = (await r.json().catch(() => ({}))) as T & { error?: string };
-  if (!r.ok) throw Object.assign(new Error(j.error ?? `Request failed (${r.status})`), { stage: 'verify' });
-  return j;
-}
-
-function plain(e: unknown): string {
-  const err = e as { message?: string; stage?: string; code?: string };
-  const m = err?.message ?? '';
-  if (/denied|reject|cancel|declin/i.test(m)) return 'Cancelled in bWalletX.';
-  if (err?.code === 'NOT_FOUND') return 'No wallet found. Open this page in bWalletX or install the extension.';
-  if (err?.stage === 'challenge') return 'Could not start the sign-in. Try again.';
-  if (err?.stage === 'identity' || err?.stage === 'signature') return 'bWalletX did not finish the approval. Try again.';
-  if (err?.stage === 'verify') return m || 'That signature was not accepted. Try again.';
-  return 'Something went wrong. Try again.';
-}
+import { LABEL, clearPendingSignIn, hubChallenge, plain, savePendingSignIn, verifySignIn } from '@/lib/signin-client';
 
 export default function SignIn({ site, authorize }: { site: string | null; authorize: Record<string, string> | null }) {
   const btn = useRef<HTMLButtonElement>(null);
@@ -39,21 +15,18 @@ export default function SignIn({ site, authorize }: { site: string | null; autho
   async function go() {
     setError(null);
     setLabel('Opening your wallet…'); // feedback before any await
+    // On a phone bWalletX returns to the hub's root page (often a new tab), which finishes from here (app/Returned.tsx).
+    savePendingSignIn(authorize);
     try {
       // ONE sheet: the challenge first (no key needed), then the identity key and the signature together.
       const r = await signInWithBwalletX({
-        // Always the hub's own protocol (bWalletX only accepts it from id.bwalletx.com), whatever the server says.
-        challenge: async () => ({ ...(await post<{ nonce: string; message: string; keyID: string }>('/api/challenge', {})), protocolID: HUB_SIGNIN_PROTOCOL }),
+        challenge: hubChallenge,
         pairing: pairingModal({ title: 'Sign in with bWalletX' }),
         onStatus: (s) => setLabel(LABEL[s]),
       });
       setLabel('Checking…');
-      const v = await post<{ next: string; paymail: string | null }>('/api/verify', {
-        identityKey: r.identityKey,
-        nonce: r.nonce,
-        signature: r.signature,
-        authorize,
-      });
+      const v = await verifySignIn(r, authorize);
+      clearPendingSignIn();
       setLabel(`Signed in as ${v.paymail ?? `${r.identityKey.slice(0, 8)}…`}`);
       // Same-origin path from the hub (validated there); the hub then redirects to the registered site address.
       window.location.assign(safeReturnTo(v.next, '/'));
