@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from 'next';
+import { headers } from 'next/headers';
 import type { ReactNode } from 'react';
 import './globals.css';
 import { RETURN_STRIP_SCRIPT } from '@/lib/return-strip';
@@ -11,12 +12,14 @@ export const metadata: Metadata = {
 
 export const viewport: Viewport = { width: 'device-width', initialScale: 1, themeColor: '#000000' };
 
-export default function RootLayout({ children }: { children: ReactNode }) {
+export default async function RootLayout({ children }: { children: ReactNode }) {
+  // The per-request CSP nonce from proxy.ts (also makes every page dynamic, so Next puts the nonce on its scripts).
+  const nonce = (await headers()).get('x-nonce') ?? undefined;
   return (
     <html lang="en">
       <head>
-        {/* Before any other script: bWalletX's return fragment (#bwx=ok&…) comes off the address bar (app/Returned.tsx). */}
-        <script dangerouslySetInnerHTML={{ __html: RETURN_STRIP_SCRIPT }} />
+        {/* Before any other script, on every path: a stray bWalletX return fragment (#bwx=ok&…) comes off the address bar. */}
+        <script nonce={nonce} dangerouslySetInnerHTML={{ __html: RETURN_STRIP_SCRIPT }} />
       </head>
       <body>
         <div className="shell">

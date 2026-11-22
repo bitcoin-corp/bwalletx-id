@@ -1,10 +1,11 @@
 // A plain module (not 'use client'), so the root layout (a server component) gets the string itself.
 
 /**
- * Runs inline in the layout's <head>, before the app's own code: on the root page (where bWalletX returns a phone),
- * moves `#bwx=ok&…` off the address bar (so nothing that loads later, and no history sync, can read it) into
- * window.__bwxReturn for <Returned/>. Same test as @bwalletx/connect's own isReturnHash; other pages are left to
- * connect, which strips the fragment itself when its module loads.
+ * Runs inline (with the CSP nonce) in the layout's <head>, before the app's own code, on every path: drops a
+ * bWalletX connect return fragment (`#bwx=ok&…`) from the address bar. The hub's sign-in (v2) never pairs a page with a
+ * wallet, so nothing here uses the fragment; a stray one (an old wallet build, a crafted link) must not stay in the
+ * address bar or in history where a later script or history sync could read it. Same test as @bwalletx/connect's
+ * isReturnHash.
  */
 export const RETURN_STRIP_SCRIPT =
-  "(function(){try{var h=location.hash;if(location.pathname==='/'&&/(^#|&)bwx=ok(&|$)/.test(h)){window.__bwxReturn=h;history.replaceState(history.state,'',location.pathname+location.search);}}catch(e){}})();";
+  "(function(){try{if(/(^#|&)bwx=ok(&|$)/.test(location.hash)){history.replaceState(history.state,'',location.pathname+location.search);}}catch(e){}})();";

@@ -2,7 +2,7 @@ import { PrivateKey } from '@bsv/sdk';
 import { clearEpochCache, clearJwksCache, handleSsoCallback, verifyHubToken, verifySiteSession, type SsoOptions } from '@bwalletx/connect/sso/server';
 import { encodeTx, randomToken, txCookieName } from '@bwalletx/connect/sso';
 import { afterEach, describe, expect, it } from 'vitest';
-import { HUB_SIGNIN_PROTOCOL, hubSignInMessage, logoutHint } from '@bwalletx/connect/sso';
+import { logoutHint } from '@bwalletx/connect/sso';
 import { newPrivateJwk, signerFromJwk } from '@/lib/keys';
 import { DEFAULT_RATE_LIMITS, MAX_SESSIONS_PER_IDENTITY, rateLimitsFromEnv } from '@/lib/config';
 import { pgHubStore, pgRoleCheck } from '@/lib/store/postgres';
@@ -10,21 +10,23 @@ import {
   CALLBACK,
   ISSUER,
   MIGRATION,
-  SHARED_LOGIN,
+  MIGRATION_2,
   SITE,
   authorizeReq,
-  challenge,
   codeFor,
+  epochGet,
   hubFetch,
   logoutFromSite,
   migratedDb,
   pkce,
-  post,
+  poll,
   rig,
+  secretForSync,
   sidOf,
   signIn,
-  signature,
+  startSignIn,
   tokenReq,
+  walletApprove,
   type StoreKind,
 } from './helpers';
 
@@ -144,7 +146,7 @@ describe.each<StoreKind>(['memory', 'postgres'])('hub (%s store)', (kind) => {
   it('a bumped epoch logs out: hub logout ends every site session', async () => {
     const { hub, clock } = await rig(kind);
     const { code, state, verifier, cookie } = await codeFor(hub);
-    const site: SsoOptions = { clientId: 'site', secret: 's'.repeat(40), hub: ISSUER, fetch: hubFetch(hub), now: () => clock.t };
+    const site: SsoOptions = { clientId: 'site', secret: 's'.repeat(40), clientSecret: secretForSync('site'), hub: ISSUER, fetch: hubFetch(hub), now: () => clock.t };
     const cb = await handleSsoCallback(
       new Request(`${CALLBACK}?code=${code}&state=${state}&iss=${encodeURIComponent(ISSUER)}`, { headers: { cookie: `${txCookieName(state)}=${encodeTx({ state, verifier, returnTo: '/home' })}` } }),
       site,
@@ -186,45 +188,6 @@ describe.each<StoreKind>(['memory', 'postgres'])('hub (%s store)', (kind) => {
     expect(r.status).toBe(200);
     expect(r.headers.get('location')).toBeNull();
     expect(await r.text()).toContain('Signed out of all b*X sites');
-  });
-
-  it('a bad signature at sign-in is refused', async () => {
-    const { hub } = await rig(kind);
-    const root = PrivateKey.fromRandom();
-    const other = PrivateKey.fromRandom();
-    const c = await challenge(hub);
-    // signed by another key, but claiming root's key
-    const r = await hub.verify(post('/api/verify', { identityKey: root.toPublicKey().toString(), nonce: c.nonce, signature: await signature(other, c.message, c.keyID) }));
-    expect(r.status).toBe(401);
-    expect(r.headers.get('set-cookie')).toBeNull();
-    // a signature over a different message
-    const c2 = await challenge(hub);
-    const r2 = await hub.verify(post('/api/verify', { identityKey: root.toPublicKey().toString(), nonce: c2.nonce, signature: await signature(root, c2.message + 'x', c2.keyID) }));
-    expect(r2.status).toBe(401);
-  });
-
-  it('a replayed challenge is refused', async () => {
-    const { hub } = await rig(kind);
-    const root = PrivateKey.fromRandom();
-    const c = await challenge(hub);
-    const body = { identityKey: root.toPublicKey().toString(), nonce: c.nonce, signature: await signature(root, c.message, c.keyID) };
-    expect((await hub.verify(post('/api/verify', body))).status).toBe(200);
-    expect((await hub.verify(post('/api/verify', body))).status).toBe(401);
-  });
-
-  it('an expired challenge is refused (2 minutes)', async () => {
-    const { hub, clock } = await rig(kind);
-    const root = PrivateKey.fromRandom();
-    const c = await challenge(hub);
-    const sig = await signature(root, c.message, c.keyID);
-    clock.t += 121_000;
-    expect((await hub.verify(post('/api/verify', { identityKey: root.toPublicKey().toString(), nonce: c.nonce, signature: sig }))).status).toBe(401);
-  });
-
-  it('challenge and verify only answer the hub’s own origin', async () => {
-    const { hub } = await rig(kind);
-    expect((await hub.challenge(post('/api/challenge', {}, { origin: 'https://evil.example' }))).status).toBe(403);
-    expect((await hub.verify(post('/api/verify', {}, { origin: 'https://evil.example' }))).status).toBe(403);
   });
 
   it('prompt=none with no session returns error=login_required to the registered redirect only', async () => {
@@ -275,10 +238,9 @@ describe.each<StoreKind>(['memory', 'postgres'])('hub (%s store)', (kind) => {
 
   it('hub cookie: __Host-, httpOnly, Secure, SameSite=Lax, 30 days; high-tier clients get tier=high in the token', async () => {
     const { hub } = await rig(kind);
-    const root = PrivateKey.fromRandom();
-    const c = await challenge(hub);
-    const r = await hub.verify(post('/api/verify', { identityKey: root.toPublicKey().toString(), nonce: c.nonce, signature: await signature(root, c.message, c.keyID) }));
-    const set = r.headers.get('set-cookie')!;
+    const s = await startSignIn(hub);
+    await walletApprove(hub, s.body.requestId, PrivateKey.fromRandom());
+    const set = (await poll(hub, s.cookie)).res.headers.getSetCookie().find((c) => c.startsWith('__Host-bwx_hub='))!;
     expect(set).toMatch(/^__Host-bwx_hub=/);
     for (const part of ['HttpOnly', 'Secure', 'SameSite=Lax', 'Path=/', `Max-Age=${30 * 24 * 3600}`]) expect(set).toContain(part);
     expect(set).not.toMatch(/Domain=/i);
@@ -291,7 +253,7 @@ describe.each<StoreKind>(['memory', 'postgres'])('hub (%s store)', (kind) => {
     const { hub, clock } = await rig(kind);
     const { code, verifier, cookie } = await codeFor(hub);
     const t = (await (await hub.token(tokenReq({ grant_type: 'authorization_code', code, code_verifier: verifier, client_id: 'site', redirect_uri: CALLBACK }))).json()) as { sid: string };
-    const ep = async () => (await hub.epoch(new Request(`${ISSUER}/session/epoch?sid=${t.sid}`))).json();
+    const ep = async () => (await epochGet(hub, t.sid)).json();
     expect(await ep()).toEqual({ sid: t.sid, active: true, epoch: 0 });
     await logoutFromSite(hub, cookie, clock);
     expect(await ep()).toMatchObject({ active: false });
@@ -299,93 +261,42 @@ describe.each<StoreKind>(['memory', 'postgres'])('hub (%s store)', (kind) => {
 });
 
 describe.each<StoreKind>(['memory', 'postgres'])('security review fixes (%s store)', (kind) => {
-  // Finding 1: the hub's own sign-in protocol and message.
-  it('challenge: the hub protocol [2, "bwalletx id sign in"], keyID = nonce, message names the hub and the challenge', async () => {
-    const { hub, clock } = await rig(kind);
-    const c = await challenge(hub);
-    expect(c.protocolID).toEqual([2, 'bwalletx id sign in']);
-    expect(c.protocolID).toEqual(HUB_SIGNIN_PROTOCOL);
-    expect(c.keyID).toBe(c.nonce);
-    expect(c.message).toBe(`Sign in to id.example · challenge ${c.nonce} · ${new Date(clock.t).toISOString()}`);
-  });
-
-  it('a signature under the shared [2, "bwallet sign in"] protocol is refused (a relayed site sign-in can not open the hub)', async () => {
-    const { hub } = await rig(kind);
-    const root = PrivateKey.fromRandom();
-    const c = await challenge(hub);
-    const r = await hub.verify(post('/api/verify', { identityKey: root.toPublicKey().toString(), nonce: c.nonce, signature: await signature(root, c.message, c.keyID, SHARED_LOGIN) }));
-    expect(r.status).toBe(401);
-    expect(r.headers.get('set-cookie')).toBeNull();
-  });
-
-  it('the hub checks the message text: a stored challenge for another host, nonce or wording is refused even when correctly signed', async () => {
-    const { hub, store, clock } = await rig(kind);
-    const root = PrivateKey.fromRandom();
-    const key = root.toPublicKey().toString();
-    const bad = (nonce: string) => [
-      hubSignInMessage('https://evil.example', nonce, clock.t),
-      hubSignInMessage(ISSUER, 'x'.repeat(22), clock.t),
-      `Sign in to example.com with bWallet\n\nNonce: ${nonce}`,
-      hubSignInMessage(ISSUER, nonce, clock.t) + ' ',
-    ];
-    for (let i = 0; i < 4; i++) {
-      const nonce = `nonce${i}`.padEnd(22, 'n');
-      const message = bad(nonce)[i];
-      await store.putChallenge(nonce, { identityKey: '', origin: ISSUER, message, expiresAt: clock.t + 60_000 });
-      const r = await hub.verify(post('/api/verify', { identityKey: key, nonce, signature: await signature(root, message, nonce) }));
-      expect(r.status, message).toBe(401);
-    }
-    // and one made for another origin
-    const nonce = 'other-origin'.padEnd(22, 'o');
-    const message = hubSignInMessage(ISSUER, nonce, clock.t);
-    await store.putChallenge(nonce, { identityKey: '', origin: 'https://evil.example', message, expiresAt: clock.t + 60_000 });
-    expect((await hub.verify(post('/api/verify', { identityKey: key, nonce, signature: await signature(root, message, nonce) }))).status).toBe(401);
-    // the well-formed control passes
-    const ok = 'good-nonce'.padEnd(22, 'g');
-    const good = hubSignInMessage(ISSUER, ok, clock.t);
-    await store.putChallenge(ok, { identityKey: '', origin: ISSUER, message: good, expiresAt: clock.t + 60_000 });
-    expect((await hub.verify(post('/api/verify', { identityKey: key, nonce: ok, signature: await signature(root, good, ok) }))).status).toBe(200);
-  });
-
   // Finding 3a: rate limits.
-  it('rate limits: challenge 10/min per IP, then 429 + Retry-After; another IP and the next minute are fine', async () => {
+  it('rate limits: sign-in start 10/min per IP, then 429 + Retry-After; another IP and the next minute are fine', async () => {
     const { hub, clock } = await rig(kind, undefined, DEFAULT_RATE_LIMITS);
     clock.t = Math.floor(clock.t / 60_000) * 60_000 + 15_000; // 15 s into a window
-    for (let i = 0; i < 10; i++) expect((await hub.challenge(post('/api/challenge', {}))).status).toBe(200);
-    const r = await hub.challenge(post('/api/challenge', {}));
+    for (let i = 0; i < 10; i++) expect((await startSignIn(hub)).res.status).toBe(200);
+    const r = (await startSignIn(hub)).res;
     expect(r.status).toBe(429);
     expect(r.headers.get('retry-after')).toBe('45');
     expect(await r.json()).toMatchObject({ error: 'rate_limited' });
-    expect((await hub.challenge(post('/api/challenge', {}, { 'x-real-ip': '198.51.100.7' }))).status).toBe(200);
+    expect((await startSignIn(hub, undefined, { 'x-real-ip': '198.51.100.7' })).res.status).toBe(200);
     clock.t += 46_000;
-    expect((await hub.challenge(post('/api/challenge', {}))).status).toBe(200);
+    expect((await startSignIn(hub)).res.status).toBe(200);
   });
 
-  it('rate limits: verify 10/min per IP (failed attempts count), and per identity key once the signature is good', async () => {
-    const { hub } = await rig(kind, undefined, { ...DEFAULT_RATE_LIMITS, challenge: 1000 });
-    for (let i = 0; i < 10; i++) expect((await hub.verify(post('/api/verify', { nonce: 'junk' }))).status).toBe(401);
-    expect((await hub.verify(post('/api/verify', { nonce: 'junk' }))).status).toBe(429);
-    // per key: 10 good sign-ins from 10 IPs, the 11th (from a fresh IP) is refused
-    const root = PrivateKey.fromRandom();
-    for (let i = 0; i < 10; i++) await signIn(hub, root, undefined, { ip: `192.0.2.${i + 10}` });
-    const c = await challenge(hub, { 'x-real-ip': '192.0.2.200' });
-    const r = await hub.verify(
-      post('/api/verify', { identityKey: root.toPublicKey().toString(), nonce: c.nonce, signature: await signature(root, c.message, c.keyID) }, { 'x-real-ip': '192.0.2.200' }),
-    );
-    expect(r.status).toBe(429);
-    expect(r.headers.get('set-cookie')).toBeNull();
-    // someone else's key is unaffected (nobody can lock a stranger out)
-    await signIn(hub, PrivateKey.fromRandom(), undefined, { ip: '192.0.2.201' });
-  });
-
-  it('rate limits: /token 60/min and /session/epoch 120/min per IP', async () => {
+  it('rate limits: the wallet endpoint 30/min per IP (failed attempts count); poll 120/min per IP', async () => {
     const { hub } = await rig(kind, undefined, DEFAULT_RATE_LIMITS);
-    const tok = () => hub.token(new Request(`${ISSUER}/token`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-real-ip': '203.0.113.9' }, body: 'grant_type=authorization_code&client_id=site&code=x' }));
-    for (let i = 0; i < 60; i++) expect((await tok()).status).toBe(400);
+    const root = PrivateKey.fromRandom();
+    const junk = () => walletApprove(hub, 'j'.repeat(22), root);
+    let last = 0;
+    for (let i = 0; i < 15; i++) last = (await junk()).status; // each junk try = a GET for info + a POST
+    expect(last).toBe(404);
+    expect((await junk()).status).toBe(429);
+    const s = await startSignIn(hub, undefined, { 'x-real-ip': '198.51.100.50' });
+    for (let i = 0; i < 120; i++) expect((await poll(hub, s.cookie, { 'x-real-ip': '198.51.100.50' })).res.status).toBe(200);
+    expect((await poll(hub, s.cookie, { 'x-real-ip': '198.51.100.50' })).res.status).toBe(429);
+  });
+
+  it('rate limits: /token 20 failed attempts/min per IP; unauthenticated /session/epoch 120/min per IP (development)', async () => {
+    const { hub } = await rig(kind, undefined, DEFAULT_RATE_LIMITS);
+    const tok = () => hub.token(tokenReq({ grant_type: 'authorization_code', client_id: 'site', code: 'x', code_verifier: 'v'.repeat(43), redirect_uri: CALLBACK }, { ip: '203.0.113.9' }));
+    for (let i = 0; i < 20; i++) expect((await tok()).status).toBe(400);
     const r = await tok();
     expect(r.status).toBe(429);
     expect(Number(r.headers.get('retry-after'))).toBeGreaterThan(0);
-    const ep = () => hub.epoch(new Request(`${ISSUER}/session/epoch?sid=${'s'.repeat(24)}`, { headers: { 'x-real-ip': '203.0.113.9' } }));
+    const dev = await rig(kind, undefined, DEFAULT_RATE_LIMITS, { clientKey: null });
+    const ep = () => dev.hub.epoch(new Request(`${ISSUER}/session/epoch?sid=${'s'.repeat(24)}`, { headers: { 'x-real-ip': '203.0.113.9' } }));
     for (let i = 0; i < 120; i++) expect((await ep()).status).toBe(200);
     expect((await ep()).status).toBe(429);
   });
@@ -410,16 +321,16 @@ describe.each<StoreKind>(['memory', 'postgres'])('security review fixes (%s stor
   });
 
   // Finding 3c: cleanup.
-  it('cleanup removes expired challenges, codes, sessions and rate-limit windows', async () => {
+  it('cleanup removes expired pending sign-ins, codes, sessions and rate-limit windows', async () => {
     const { hub, store, clock } = await rig(kind);
     const real = Date.now();
     clock.t = real;
-    await store.putChallenge('old'.padEnd(22, 'o'), { identityKey: '', origin: ISSUER, message: 'm', expiresAt: real - 1000 });
+    await store.putPendingSignIn({ requestId: 'old'.padEnd(22, 'o'), browserHash: 'bh-old', userCode: 'BCDF-GHJK', clientId: null, authorize: null, message: 'm', status: 'pending', identityKey: null, attempts: 0, createdAt: real - 400_000, expiresAt: real - 1000 });
     await store.putCode('codehash', { clientId: 'site', redirectUri: CALLBACK, codeChallenge: 'c', sid: 's', identityKey: 'k', expiresAt: real - 1000 });
     await store.hit('x:ip:y', 1000, real - 10_000);
     await store.createSession({ sid: 'expired-sid-1', tokenHash: 'th1', identityKey: '02'.padEnd(66, 'a'), paymail: null, handle: null, epoch: 0, authTime: real, createdAt: real, rotatedAt: real, expiresAt: real - 2 * 86400_000 });
     await store.cleanup();
-    expect(await store.takeChallenge('old'.padEnd(22, 'o'))).toBeNull();
+    expect(await store.getPendingSignIn('old'.padEnd(22, 'o'))).toBeNull();
     expect(await store.takeCode('codehash')).toBeNull();
     expect(await store.getSession('expired-sid-1')).toBeNull();
     expect((await store.hit('x:ip:y', 1000, real - 10_000)).hits).toBe(1); // the old window was deleted, so it starts again
@@ -441,8 +352,8 @@ describe.each<StoreKind>(['memory', 'postgres'])('security review fixes (%s stor
     expect(html).toContain('<meta name="referrer" content="same-origin">');
     expect(await sidOf(hub, cookie)).not.toBeNull();
     // a hint for another session is no better than none
-    const wrong = await logoutHint('not-this-session', Math.floor(Date.now() / 1000));
-    const r2 = await hub.logout(new Request(`${ISSUER}/logout?logout_hint=${wrong}`, { headers: { cookie } }));
+    const wrong = await logoutHint('not-this-session', { clientId: 'site', clientSecret: secretForSync('site') }, Math.floor(Date.now() / 1000));
+    const r2 = await hub.logout(new Request(`${ISSUER}/logout?client_id=site&logout_hint=${wrong}`, { headers: { cookie } }));
     expect(await r2.text()).toContain('Sign out of all b*X sites?');
     expect(await sidOf(hub, cookie)).not.toBeNull();
     // an unregistered redirect_uri is dropped from the form
@@ -493,7 +404,7 @@ describe.each<StoreKind>(['memory', 'postgres'])('security review fixes (%s stor
     expect(after.sid).toBe(sid);
     expect(after.authTime).toBe(clock.t);
     expect(after.authTime).toBeGreaterThan(before.authTime);
-    expect(await (await hub.epoch(new Request(`${ISSUER}/session/epoch?sid=${sid}`))).json()).toMatchObject({ active: true });
+    expect(await (await epochGet(hub, sid!)).json()).toMatchObject({ active: true });
     // the new auth_time reaches the next ID token
     const p = await pkce();
     const state = randomToken(24);
@@ -510,7 +421,7 @@ describe.each<StoreKind>(['memory', 'postgres'])('security review fixes (%s stor
     const sidA = await sidOf(hub, a.cookie);
     const b = await signIn(hub, PrivateKey.fromRandom(), undefined, { cookie: a.cookie });
     expect(await sidOf(hub, b.cookie)).not.toBe(sidA);
-    expect(await (await hub.epoch(new Request(`${ISSUER}/session/epoch?sid=${sidA}`))).json()).toMatchObject({ active: false });
+    expect(await (await epochGet(hub, sidA!)).json()).toMatchObject({ active: false });
   });
 });
 
@@ -522,7 +433,7 @@ describe('database: least-privilege role, own schema, RLS', () => {
     const tables = (await db.query<{ relname: string; relrowsecurity: boolean }>(
       `select c.relname, c.relrowsecurity from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'sso' and c.relkind = 'r' order by 1`,
     )).rows;
-    expect(tables).toEqual(['challenges', 'codes', 'epochs', 'rate_limits', 'sessions'].map((relname) => ({ relname, relrowsecurity: true })));
+    expect(tables).toEqual(['challenges', 'codes', 'epochs', 'pending_signins', 'rate_limits', 'sessions'].map((relname) => ({ relname, relrowsecurity: true })));
     expect((await db.query(`select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relname like 'sso_%'`)).rows).toEqual([]);
     for (const r of ['anon', 'authenticated']) {
       const has = (await db.query<{ u: boolean; s: boolean }>(`select has_schema_privilege('${r}', 'sso', 'usage') as u, has_table_privilege('${r}', 'sso.sessions', 'select') as s`)).rows[0];
@@ -550,7 +461,8 @@ describe('database: least-privilege role, own schema, RLS', () => {
   it('the migration can be run twice (pg_cron block skipped where pg_cron is not installed)', async () => {
     const db = await migratedDb();
     await db.exec(MIGRATION);
-    expect((await db.query(`select count(*)::int as n from pg_policies where schemaname = 'sso' and policyname = 'sso_hub_all'`)).rows[0]).toEqual({ n: 5 });
+    await db.exec(MIGRATION_2);
+    expect((await db.query(`select count(*)::int as n from pg_policies where schemaname = 'sso' and policyname = 'sso_hub_all'`)).rows[0]).toEqual({ n: 6 });
   });
 });
 

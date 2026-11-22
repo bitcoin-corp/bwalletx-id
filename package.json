@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "gen-key": "node --experimental-strip-types scripts/gen-signing-key.ts",
+    "client-secret": "node --experimental-strip-types scripts/client-secret.ts",
     "e2e": "node test/e2e/run.mjs"
   },
   "dependencies": {

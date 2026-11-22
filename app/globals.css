@@ -37,3 +37,4 @@ a { color: var(--gold); }
 .err { margin: 14px 0 0; padding: 10px 14px; border-radius: 12px; border: 1px solid var(--gold); background: #1a1300; color: var(--gold-hi); overflow-wrap: anywhere; }
 .foot { padding: 16px; text-align: center; font-size: 13px; color: var(--gold-soft); }
 .key { font-family: ui-monospace, Menlo, monospace; font-size: 13px; overflow-wrap: anywhere; }
+.code { margin: 6px 0 16px; text-align: center; font-family: ui-monospace, Menlo, monospace; font-size: 34px; font-weight: 800; letter-spacing: .12em; color: var(--gold-hi); overflow-wrap: anywhere; }

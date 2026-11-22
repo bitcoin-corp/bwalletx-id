@@ -4,7 +4,7 @@
  * No driver is imported here: pass `query(sql, params)` resolving to `{ rows }` (node-postgres, PGlite) or an array
  * (postgres.js `sql.unsafe`). `fromUrl` below builds one with postgres.js from a server-only URL.
  */
-import type { CodeRecord, HubSession, HubStore, PendingChallenge, SessionPatch } from './types';
+import type { CodeRecord, HubSession, HubStore, PendingSignIn, SessionPatch } from './types';
 
 export type PgQuery = (sql: string, params: unknown[]) => Promise<{ rows: unknown[] } | unknown[]>;
 type Row = Record<string, unknown>;
@@ -32,21 +32,81 @@ function toSession(r: Row): HubSession {
   };
 }
 
+const SIGNIN_COLS = `request_id, browser_hash, user_code, client_id, authorize, message, status, identity_key, attempts,
+  ${T('created_at')} as created_ms, ${T('expires_at')} as expires_ms`;
+
+function toSignIn(r: Row): PendingSignIn {
+  let authorize: Record<string, string> | null = null;
+  try {
+    authorize = r.authorize ? (JSON.parse(String(r.authorize)) as Record<string, string>) : null;
+  } catch {
+    authorize = null;
+  }
+  return {
+    requestId: String(r.request_id),
+    browserHash: String(r.browser_hash),
+    userCode: String(r.user_code),
+    clientId: (r.client_id as string | null) ?? null,
+    authorize,
+    message: String(r.message),
+    status: String(r.status) as PendingSignIn['status'],
+    identityKey: (r.identity_key as string | null) ?? null,
+    attempts: Number(r.attempts),
+    createdAt: ms(r.created_ms),
+    expiresAt: ms(r.expires_ms),
+  };
+}
+
 export function pgHubStore(query: PgQuery): HubStore {
   return {
-    async putChallenge(nonce, c: PendingChallenge) {
-      await query(`delete from sso.challenges where expires_at < now()`, []);
-      await query(`insert into sso.challenges (nonce, identity_key, origin, message, expires_at) values ($1, $2, $3, $4, to_timestamp($5))`, [
-        nonce,
-        c.identityKey,
-        c.origin,
-        c.message,
-        ts(c.expiresAt),
-      ]);
+    async putPendingSignIn(p) {
+      await query(`delete from sso.pending_signins where expires_at < now()`, []);
+      const r = rows(
+        await query(
+          `insert into sso.pending_signins (request_id, browser_hash, user_code, client_id, authorize, message, status, identity_key, attempts, created_at, expires_at)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, to_timestamp($10), to_timestamp($11)) on conflict do nothing returning request_id`,
+          [p.requestId, p.browserHash, p.userCode, p.clientId, p.authorize ? JSON.stringify(p.authorize) : null, p.message, p.status, p.identityKey, p.attempts, ts(p.createdAt), ts(p.expiresAt)],
+        ),
+      );
+      return r.length === 1;
     },
-    async takeChallenge(nonce) {
-      const r = rows(await query(`delete from sso.challenges where nonce = $1 returning identity_key, origin, message, ${T('expires_at')} as expires_ms`, [nonce]))[0];
-      return r ? { identityKey: String(r.identity_key), origin: String(r.origin), message: String(r.message), expiresAt: ms(r.expires_ms) } : null;
+    async getPendingSignIn(id) {
+      const r = rows(await query(`select ${SIGNIN_COLS} from sso.pending_signins where request_id = $1`, [id]))[0];
+      return r ? toSignIn(r) : null;
+    },
+    async getPendingSignInByCode(code) {
+      const r = rows(await query(`select ${SIGNIN_COLS} from sso.pending_signins where user_code = $1`, [code]))[0];
+      return r ? toSignIn(r) : null;
+    },
+    async getPendingSignInByBrowser(h) {
+      const r = rows(await query(`select ${SIGNIN_COLS} from sso.pending_signins where browser_hash = $1`, [h]))[0];
+      return r ? toSignIn(r) : null;
+    },
+    async approvePendingSignIn(id, identityKey, t) {
+      const r = rows(
+        await query(
+          `update sso.pending_signins set status = 'approved', identity_key = $2
+           where request_id = $1 and status = 'pending' and expires_at > to_timestamp($3) returning request_id`,
+          [id, identityKey, ts(t)],
+        ),
+      );
+      return r.length === 1;
+    },
+    async failPendingSignIn(id, max) {
+      await query(
+        `update sso.pending_signins set attempts = attempts + 1, status = case when attempts + 1 >= $2 then 'failed' else status end
+         where request_id = $1 and status = 'pending'`,
+        [id, max],
+      );
+    },
+    async takeApprovedSignIn(h, t) {
+      const r = rows(
+        await query(
+          `update sso.pending_signins set status = 'used' where browser_hash = $1 and status = 'approved' and expires_at > to_timestamp($2) returning ${SIGNIN_COLS}`,
+          [h, ts(t)],
+        ),
+      )[0];
+      return r ? toSignIn(r) : null;
     },
     async putCode(h, c: CodeRecord) {
       await query(`delete from sso.codes where expires_at < now()`, []);
@@ -146,6 +206,11 @@ export function pgHubStore(query: PgQuery): HubStore {
         ),
       )[0];
       return { hits: Number(r.hits), resetAt };
+    },
+    async peek(bucket, windowMs, t) {
+      const start = Math.floor(t / windowMs) * windowMs;
+      const r = rows(await query(`select hits from sso.rate_limits where bucket = $1 and window_start = to_timestamp($2)`, [bucket, ts(start)]))[0];
+      return { hits: r ? Number(r.hits) : 0, resetAt: start + windowMs };
     },
     async cleanup() {
       await query(`select sso.cleanup()`, []);

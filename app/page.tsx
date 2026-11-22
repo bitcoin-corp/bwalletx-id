@@ -1,22 +1,9 @@
 import { cookies } from 'next/headers';
 import { getHub } from '@/lib/instance';
-import Returned from './Returned';
 
 export const dynamic = 'force-dynamic';
 
 export default async function Home() {
-  return (
-    <>
-      {/* bWalletX returns a phone here; the layout's head script has already taken #bwx=ok&… off the address bar. */}
-      <Returned />
-      <div data-home style={{ display: 'contents' }}>
-        <HomeCard />
-      </div>
-    </>
-  );
-}
-
-async function HomeCard() {
   const hub = await getHub();
   const jar = await cookies();
   const header = jar.getAll().map((c) => `${c.name}=${c.value}`).join('; ');

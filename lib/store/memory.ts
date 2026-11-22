@@ -1,8 +1,8 @@
-import type { CodeRecord, HubSession, HubStore, PendingChallenge } from './types';
+import type { CodeRecord, HubSession, HubStore, PendingSignIn } from './types';
 
 /** In-memory store for dev and tests. Lost on restart and not shared between instances: never use in production. */
 export function memoryHubStore(now: () => number = Date.now): HubStore {
-  const challenges = new Map<string, PendingChallenge>();
+  const signins = new Map<string, PendingSignIn>();
   const codes = new Map<string, CodeRecord>();
   const sessions = new Map<string, HubSession>();
   const byToken = new Map<string, string>();
@@ -13,14 +13,45 @@ export function memoryHubStore(now: () => number = Date.now): HubStore {
     for (const [k, v] of m) if (v.expiresAt < t) m.delete(k);
   };
   return {
-    async putChallenge(nonce, c) {
-      prune(challenges);
-      challenges.set(nonce, { ...c });
+    async putPendingSignIn(p) {
+      prune(signins);
+      for (const x of signins.values()) if (x.requestId === p.requestId || x.userCode === p.userCode || x.browserHash === p.browserHash) return false;
+      signins.set(p.requestId, { ...p, authorize: p.authorize ? { ...p.authorize } : null });
+      return true;
     },
-    async takeChallenge(nonce) {
-      const c = challenges.get(nonce) ?? null;
-      challenges.delete(nonce);
-      return c;
+    async getPendingSignIn(id) {
+      const p = signins.get(id);
+      return p ? { ...p } : null;
+    },
+    async getPendingSignInByCode(code) {
+      for (const p of signins.values()) if (p.userCode === code) return { ...p };
+      return null;
+    },
+    async getPendingSignInByBrowser(h) {
+      for (const p of signins.values()) if (p.browserHash === h) return { ...p };
+      return null;
+    },
+    async approvePendingSignIn(id, identityKey, t) {
+      const p = signins.get(id);
+      if (!p || p.status !== 'pending' || p.expiresAt <= t) return false;
+      p.status = 'approved';
+      p.identityKey = identityKey;
+      return true;
+    },
+    async failPendingSignIn(id, max) {
+      const p = signins.get(id);
+      if (!p || p.status !== 'pending') return;
+      p.attempts += 1;
+      if (p.attempts >= max) p.status = 'failed';
+    },
+    async takeApprovedSignIn(h, t) {
+      for (const p of signins.values()) {
+        if (p.browserHash !== h) continue;
+        if (p.status !== 'approved' || p.expiresAt <= t) return null;
+        p.status = 'used';
+        return { ...p };
+      }
+      return null;
     },
     async putCode(h, c) {
       prune(codes);
@@ -84,8 +115,12 @@ export function memoryHubStore(now: () => number = Date.now): HubStore {
       limits.set(key, cur);
       return { hits: cur.hits, resetAt };
     },
+    async peek(bucket, windowMs, t) {
+      const start = Math.floor(t / windowMs) * windowMs;
+      return { hits: limits.get(`${bucket} ${start}`)?.hits ?? 0, resetAt: start + windowMs };
+    },
     async cleanup() {
-      prune(challenges);
+      prune(signins);
       prune(codes);
       prune(limits);
       const day = now() - 24 * 3600 * 1000;

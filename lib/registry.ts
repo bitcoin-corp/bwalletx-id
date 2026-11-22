@@ -14,6 +14,8 @@ export interface Client {
   redirect_uris: string[];
   /** Honoured only when NODE_ENV !== 'production'. */
   dev_redirect_uris?: string[];
+  /** Bump to rotate this client's secret (lib/clients.ts). Default 1. */
+  secret_version?: number;
 }
 
 const ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -39,6 +41,7 @@ export class Registry {
       if (this.byId.has(c.client_id)) throw new Error(`duplicate client_id: ${c.client_id}`);
       if (c.tier !== 'standard' && c.tier !== 'high') throw new Error(`bad tier for ${c.client_id}`);
       if (!c.name) throw new Error(`client ${c.client_id} needs a name`);
+      if (c.secret_version !== undefined && !(Number.isInteger(c.secret_version) && c.secret_version >= 1)) throw new Error(`bad secret_version for ${c.client_id}`);
       c.redirect_uris.forEach((u) => checkUri(u, false));
       (c.dev_redirect_uris ?? []).forEach((u) => checkUri(u, true));
       const allowed = new Set([...c.redirect_uris, ...(opts.dev ? (c.dev_redirect_uris ?? []) : [])]);

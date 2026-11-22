@@ -4,10 +4,26 @@
  * `take*` must read and delete in one step, so a challenge or code can be used once.
  */
 
-export interface PendingChallenge {
-  identityKey: string;
-  origin: string;
+/**
+ * A hub sign-in in progress (v2). The browser that started it holds a random secret in an HttpOnly cookie (only its
+ * SHA-256 is stored); the wallet approves it by request id + user code, POSTing its signature straight to the hub.
+ */
+export interface PendingSignIn {
+  /** Public: goes in the wallet link. */
+  requestId: string;
+  /** SHA-256 of the browser's cookie secret. */
+  browserHash: string;
+  /** BCDF-GHJK, shown on the page and in the wallet. */
+  userCode: string;
+  clientId: string | null;
+  /** The site's /authorize request (without prompt), re-checked when used. */
+  authorize: Record<string, string> | null;
+  /** The exact text the wallet signs. */
   message: string;
+  status: 'pending' | 'approved' | 'used' | 'failed';
+  identityKey: string | null;
+  attempts: number;
+  createdAt: number;
   expiresAt: number;
 }
 
@@ -37,8 +53,17 @@ export interface HubSession {
 }
 
 export interface HubStore {
-  putChallenge(nonce: string, c: PendingChallenge): Promise<void>;
-  takeChallenge(nonce: string): Promise<PendingChallenge | null>;
+  /** False if the request id, user code or browser hash is already taken (the caller retries with new values). */
+  putPendingSignIn(p: PendingSignIn): Promise<boolean>;
+  getPendingSignIn(requestId: string): Promise<PendingSignIn | null>;
+  getPendingSignInByCode(userCode: string): Promise<PendingSignIn | null>;
+  getPendingSignInByBrowser(browserHash: string): Promise<PendingSignIn | null>;
+  /** pending → approved with this key, only if still pending and unexpired at `now`. True if it changed. */
+  approvePendingSignIn(requestId: string, identityKey: string, now: number): Promise<boolean>;
+  /** One more bad attempt; at maxAttempts a pending sign-in becomes failed. */
+  failPendingSignIn(requestId: string, maxAttempts: number): Promise<void>;
+  /** approved → used for this browser, only if unexpired at `now`; returns it, or null. Read and change in one step. */
+  takeApprovedSignIn(browserHash: string, now: number): Promise<PendingSignIn | null>;
   putCode(codeHash: string, c: CodeRecord): Promise<void>;
   takeCode(codeHash: string): Promise<CodeRecord | null>;
   createSession(s: HubSession): Promise<void>;
@@ -57,7 +82,9 @@ export interface HubStore {
    * aligned to the epoch). Returns the hits so far in this window, including this one, and when the window ends.
    */
   hit(bucket: string, windowMs: number, now: number): Promise<{ hits: number; resetAt: number }>;
-  /** Delete expired challenges, codes, sessions (a day after expiry) and rate-limit windows. */
+  /** The hits so far in the window containing `now`, without counting one. */
+  peek(bucket: string, windowMs: number, now: number): Promise<{ hits: number; resetAt: number }>;
+  /** Delete expired pending sign-ins, codes, sessions (a day after expiry) and rate-limit windows. */
   cleanup(): Promise<void>;
 }
 

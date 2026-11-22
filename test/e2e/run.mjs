@@ -1,6 +1,6 @@
 // End-to-end: the full redirect dance between the hub (localhost:3400) and BSVAPI (localhost:3401) in headless Chrome.
-// The wallet is a THROWAWAY key made here with @bsv/sdk ProtoWallet, exposed to the hub page as window.CWI (what the
-// bWalletX in-app browser provides). Never a real key. Uses localhost, not 127.0.0.1 (bWalletX refuses IP origins).
+// The wallet is a THROWAWAY key made here with @bsv/sdk ProtoWallet, playing bWalletX's side of hub sign-in v2 from
+// Node (it POSTs straight to the hub; the page never sees it). Never a real key. Uses localhost, not 127.0.0.1 (bWalletX refuses IP origins).
 //
 //   HUB=http://localhost:3400 SITE=http://localhost:3401 node test/e2e/run.mjs
 //   env: PUPPETEER (path to puppeteer's ESM entry), CHROME (Chrome binary), SHOTS (dir for screenshots, outside git)
@@ -39,30 +39,27 @@ const nav = [];
 page.on('request', (r) => r.isNavigationRequest() && r.frame() === page.mainFrame() && nav.push(r.url()));
 page.on('pageerror', (e) => console.log('  [pageerror]', e.message));
 
-// The test wallet, answering BRC-100 calls from the hub page.
-await page.exposeFunction('__bwxTestWallet', async (method, args) => {
-  const t0 = Date.now();
-  const rec = { method, t0, t1: 0, args };
-  calls.push(rec);
-  await new Promise((r) => setTimeout(r, 25)); // a wallet takes a moment; lets us see the calls overlap
-  let out;
-  if (method === 'getPublicKey') out = await pw.getPublicKey(args);
-  else if (method === 'createSignature') out = { signature: Array.from((await pw.createSignature(args)).signature) };
-  else if (method === 'isAuthenticated' || method === 'waitForAuthentication') out = { authenticated: true };
-  else throw new Error(`test wallet: ${method} not supported`);
-  rec.t1 = Date.now();
-  return out;
-});
-await page.evaluateOnNewDocument((hub) => {
-  if (location.origin !== hub) return; // only the hub talks to the wallet; sites never do
-  const call = (m) => (a) => window.__bwxTestWallet(m, a ?? {});
-  window.CWI = {
-    isAuthenticated: call('isAuthenticated'),
-    waitForAuthentication: call('waitForAuthentication'),
-    getPublicKey: call('getPublicKey'),
-    createSignature: call('createSignature'),
-  };
-}, HUB);
+// The test wallet (hub sign-in v2): it never talks to the page. Like bWalletX, it reads the request id from the page's
+// "Open bWalletX" link, GETs what to show from the hub, checks the code matches the page, signs, and POSTs straight to
+// the hub (no Origin header: a native app).
+async function approveInWallet(p) {
+  await p.waitForSelector('[data-open-wallet]', { timeout: 120000 });
+  const link = await p.$eval('[data-open-wallet]', (e) => e.getAttribute('href'));
+  const shown = await p.$eval('[data-user-code]', (e) => e.textContent.trim());
+  const requestId = new URL(link.replace('bwalletx://', 'https://x/')).searchParams.get('r');
+  const info = await (await fetch(`${HUB}/api/wallet-signin?r=${requestId}`)).json();
+  calls.push({ method: 'info', args: info });
+  if (info.userCode !== shown) throw new Error(`code mismatch: page ${shown}, hub ${info.userCode}`);
+  const { signature } = await pw.createSignature({ protocolID: info.protocolID, keyID: info.keyID, counterparty: 'anyone', data: Array.from(new TextEncoder().encode(info.message)) });
+  calls.push({ method: 'createSignature', args: { protocolID: info.protocolID, keyID: info.keyID, message: info.message } });
+  const r = await fetch(`${HUB}/api/wallet-signin`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ requestId, userCode: info.userCode, identityKey, signature: Array.from(signature) }),
+  });
+  if (r.status !== 200) throw new Error(`wallet approve ${r.status}`);
+  return info;
+}
 
 const siteCookies = async () => (await page.cookies(SITE)).filter((c) => c.name === 'bwx_site');
 const sessionJson = () => page.evaluate(async () => (await fetch('/sso/session')).json());
@@ -94,23 +91,17 @@ try {
   check(bg === 'rgb(0, 0, 0)', `hub is gold on black (body ${bg})`);
   await page.screenshot({ path: path.join(SHOTS, 'e2e-2-hub-signin.png') });
 
-  // 3. Sign in with the throwaway wallet → verify → code → BSVAPI /sso/callback → site cookie → back home.
+  // 3. Start the sign-in: the page shows a code; the wallet approves straight to the hub; the page polls and goes on.
   nav.length = 0;
   calls.length = 0;
   await page.click('[data-signin-button]');
+  const info = await approveInWallet(page);
   await page.waitForFunction((site) => location.origin === site, { timeout: 120000 }, SITE);
   await page.waitForSelector('[data-bwx-sso-chip]', { timeout: 120000 });
-  const key = calls.find((c) => c.method === 'getPublicKey');
   const sig = calls.find((c) => c.method === 'createSignature');
-  check(!!key && !!sig && key.t0 < sig.t1 && sig.t0 < key.t1, 'one sheet: getPublicKey and createSignature were in flight together');
-  check(
-    JSON.stringify(sig?.args?.protocolID) === JSON.stringify([2, 'bwalletx id sign in']),
-    `wallet asked to sign under the hub's own protocol ${JSON.stringify(sig?.args?.protocolID)} (not [2,"bwallet sign in"])`,
-  );
-  const signedText = new TextDecoder().decode(new Uint8Array(sig?.args?.data ?? []));
-  const host = new URL(HUB).host;
-  const m = new RegExp(`^Sign in to ${host.replace(/[.]/g, '\\.')} · challenge ([A-Za-z0-9_-]+) · \\d{4}-\\d{2}-\\d{2}T[0-9:.]+Z$`).exec(signedText);
-  check(!!m && sig.args.keyID === m[1], `signed message names the hub and the challenge (keyID = nonce): "${signedText}"`);
+  check(JSON.stringify(sig?.args?.protocolID) === JSON.stringify([2, 'admin bwalletx hub signin']), `wallet signed under the admin-reserved hub protocol ${JSON.stringify(sig?.args?.protocolID)}`);
+  check(sig?.args?.keyID === info.requestId && sig.args.message.includes(`Code: ${info.userCode}`) && sig.args.message.includes(`Hub: ${new URL(HUB).host}`), 'signed message names the hub, the request and the code');
+  check(!(await page.cookies(HUB)).some((c) => c.name.endsWith('bwx_signin') && c.value), 'pending sign-in cookie cleared after use');
   check(nav.some((u) => u.startsWith(SITE + '/sso/callback?code=')), 'hub redirected to BSVAPI /sso/callback with a code');
   check(nav.some((u) => u.startsWith(HUB + '/authorize?')), 'went through hub /authorize after the wallet sign-in');
   const cookies = await siteCookies();
@@ -171,6 +162,7 @@ try {
   await Promise.all([page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 120000 }), page.click('[data-bwx-sso-signin]')]);
   await page.waitForSelector('[data-signin-button]', { timeout: 120000 });
   await page.click('[data-signin-button]');
+  await approveInWallet(page);
   await page.waitForFunction((site) => location.origin === site, { timeout: 120000 }, SITE);
   await page.waitForSelector('[data-bwx-sso-chip]', { timeout: 120000 });
   const hubLive = async () => (await page.cookies(HUB)).some((c) => c.name === 'bwx_hub' && c.value);

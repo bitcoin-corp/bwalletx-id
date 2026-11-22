@@ -3,7 +3,7 @@ import { memoryHubStore } from './memory';
 import { pgHubStore, pgQueryFromUrl, pgRoleCheck } from './postgres';
 import type { HubStore } from './types';
 
-export type { HubStore, HubSession, CodeRecord, PendingChallenge, SessionPatch } from './types';
+export type { HubStore, HubSession, CodeRecord, PendingSignIn, SessionPatch } from './types';
 export { memoryHubStore } from './memory';
 export { pgHubStore, pgRoleCheck } from './postgres';
 

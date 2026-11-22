@@ -32,7 +32,13 @@ h1{font-size:22px;margin:0 0 8px}p{margin:0 0 18px;color:#ffd96a;overflow-wrap:a
 </style></head><body><main><div class="card"><div class="b">b</div><h1>${esc(o.title)}</h1><p>${esc(o.body)}</p>${form}${links}</div></main></body></html>`;
   return new Response(html, {
     status: o.status ?? 200,
-    headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-frame-options': 'DENY', 'content-security-policy': "frame-ancestors 'none'" },
+    headers: {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-frame-options': 'DENY',
+      // No scripts at all on these pages: inline styles only, and the one form posts to the hub itself.
+      'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    },
   });
 }
 
