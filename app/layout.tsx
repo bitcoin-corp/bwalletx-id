@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from 'next';
 import type { ReactNode } from 'react';
 import './globals.css';
+import { RETURN_STRIP_SCRIPT } from '@/lib/return-strip';
 
 export const metadata: Metadata = {
   title: 'Sign in · bWalletX',
@@ -13,6 +14,10 @@ export const viewport: Viewport = { width: 'device-width', initialScale: 1, them
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
+      <head>
+        {/* Before any other script: bWalletX's return fragment (#bwx=ok&…) comes off the address bar (app/Returned.tsx). */}
+        <script dangerouslySetInnerHTML={{ __html: RETURN_STRIP_SCRIPT }} />
+      </head>
       <body>
         <div className="shell">
           <header className="top">

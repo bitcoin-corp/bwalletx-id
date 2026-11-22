@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "@bsv/sdk": "^2.8.11",
-    "@bwalletx/connect": "file:../bwalletx-connect-sso",
+    "@bwalletx/connect": "0.10.0",
     "jose": "^6.2.0",
     "next": "^16.1.6",
     "postgres": "^3.4.9",
